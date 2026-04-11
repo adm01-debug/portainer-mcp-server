@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  portainer-mcp:
+    build: .
+    container_name: portainer-mcp-server
+    restart: unless-stopped
+    environment:
+      - TRANSPORT=http
+      - PORT=3000
+      - PORTAINER_URL=${PORTAINER_URL}
+      - PORTAINER_API_KEY=${PORTAINER_API_KEY}
+    networks:
+      - AtomicaBRNet
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.portainer-mcp.rule=Host(`portainer-mcp.atomicabr.com.br`)"
+      - "traefik.http.routers.portainer-mcp.entrypoints=websecure"
+      - "traefik.http.routers.portainer-mcp.tls=true"
+      - "traefik.http.routers.portainer-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.portainer-mcp.loadbalancer.server.port=3000"
+
+networks:
+  AtomicaBRNet:
+    external: true
