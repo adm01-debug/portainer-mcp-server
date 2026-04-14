@@ -1,7 +1,7 @@
 {
   "name": "portainer-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP Server for Portainer Docker Management",
+  "version": "1.3.0",
+  "description": "MCP Server for Portainer Docker Management (CORS, rate limit, metrics, readiness)",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
