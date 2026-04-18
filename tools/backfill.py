@@ -1,133 +1,207 @@
 #!/usr/bin/env python3
 """
-Backfill de mensagens perdidas entre 15-18/04/2026.
-Lê do Postgres Evolution (local VPS) e imprime JSON batches em stdout.
-Um orquestrador externo consome via logs Docker e chama fn_backfill_messages no FATOR X.
+Backfill v2 — envia mensagens perdidas como eventos MESSAGES_UPSERT
+para a Edge Function evolution-webhook (pública, já em produção).
+
+Vantagens:
+- Zero credenciais novas (só usa webhook secret já conhecido)
+- Aproveita toda a lógica de processamento da webhook existente
+- Idempotente (UPSERT em evolution_messages por message_id)
+- Logs ficam no evolution_webhook_events para auditoria
 
 Uso:
-  EV_DB_URL=... INSTANCE_ID=... START_EPOCH=... END_EPOCH=... python3 backfill.py
+  EV_DB_URL=... WEBHOOK_URL=... WEBHOOK_SECRET=... MODE={schema|count|replay} python3 backfill.py
 """
 import os
 import sys
 import json
+import time
+import urllib.request
+import urllib.error
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone
 
 EV_DB_URL = os.environ['EV_DB_URL']
+WEBHOOK_URL = os.environ.get(
+    'WEBHOOK_URL',
+    'https://tdprnylgyrogbbhgdoik.supabase.co/functions/v1/evolution-webhook'
+)
+WEBHOOK_SECRET = os.environ.get(
+    'WEBHOOK_SECRET',
+    'promo-brindes-evolution-4d4565def0706d8ab270066754a2de95d11cf95cfd7da0b8e20221791bf08058'
+)
 INSTANCE_ID = os.environ.get('INSTANCE_ID', 'bd3ee04a-9054-4879-af90-84da3843fd27')
+INSTANCE_NAME = os.environ.get('INSTANCE_NAME', 'wpp2')
 START_EPOCH = int(os.environ.get('START_EPOCH', '1776250800'))  # 15/04 11:00 UTC
 END_EPOCH = int(os.environ.get('END_EPOCH', '1776526800'))      # 18/04 15:20 UTC
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '100'))
-MODE = os.environ.get('MODE', 'schema')  # schema | count | dump
+MODE = os.environ.get('MODE', 'schema')  # schema | count | replay
+DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+MAX_MSGS = int(os.environ.get('MAX_MSGS', '30000'))
 
 
 def log(msg):
     print(f'[backfill {datetime.now(timezone.utc).isoformat()}] {msg}', flush=True)
 
 
-def main():
-    log(f'Starting. MODE={MODE}  window={START_EPOCH}..{END_EPOCH}  instance={INSTANCE_ID}')
-    conn = psycopg2.connect(EV_DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+def post_webhook(event: str, data: dict) -> int:
+    """Chama a Edge Function evolution-webhook. Retorna status HTTP."""
+    payload = {
+        'event': event,
+        'instance': INSTANCE_NAME,
+        'data': data
+    }
+    body = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(
+        WEBHOOK_URL,
+        data=body,
+        headers={
+            'Content-Type': 'application/json',
+            'x-webhook-secret': WEBHOOK_SECRET,
+        },
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.getcode()
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        log(f'  webhook error: {e}')
+        return -1
 
-    # Step 1: Descobrir tabelas relevantes
+
+def get_table_and_columns(cur) -> tuple:
+    """Descobre qual é a tabela de mensagens e suas colunas."""
     cur.execute("""
         SELECT table_name
         FROM information_schema.tables
-        WHERE table_schema='public' AND (
-            lower(table_name) LIKE '%message%'
-            OR lower(table_name) LIKE '%chat%'
-            OR lower(table_name) LIKE '%instance%'
-        )
+        WHERE table_schema='public' AND lower(table_name) IN ('message', 'messages')
         ORDER BY table_name
     """)
     tables = [r['table_name'] for r in cur.fetchall()]
-    log(f'Candidate tables: {tables}')
+    if not tables:
+        return None, []
+    tbl = tables[0]
+    cur.execute("""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_name = %s AND table_schema='public'
+        ORDER BY ordinal_position
+    """, (tbl,))
+    cols = [(r['column_name'], r['data_type']) for r in cur.fetchall()]
+    return tbl, cols
 
-    # Step 2: Se mode=schema, descreve cada tabela
+
+def build_upsert_event(row: dict) -> dict:
+    """Converte linha do Postgres Evolution em payload messages.upsert."""
+    key = row.get('key') or {}
+    if isinstance(key, str):
+        try:
+            key = json.loads(key)
+        except Exception:
+            key = {}
+    message = row.get('message') or {}
+    if isinstance(message, str):
+        try:
+            message = json.loads(message)
+        except Exception:
+            message = {}
+
+    return {
+        'key': {
+            'id': key.get('id') or row.get('id'),
+            'remoteJid': key.get('remoteJid') or row.get('remoteJid'),
+            'fromMe': key.get('fromMe', row.get('fromMe', False)),
+        },
+        'pushName': row.get('pushName') or row.get('push_name'),
+        'message': message,
+        'messageType': row.get('messageType') or row.get('message_type'),
+        'messageTimestamp': row.get('messageTimestamp') or row.get('timestamp'),
+        'status': row.get('status'),
+        'instanceId': row.get('instanceId') or INSTANCE_ID,
+        'source': 'backfill-recovery-2026-04-18',
+    }
+
+
+def main():
+    log(f'Starting. MODE={MODE} window={START_EPOCH}..{END_EPOCH} instance={INSTANCE_NAME}')
+    log(f'Webhook: {WEBHOOK_URL}')
+    log(f'DRY_RUN={DRY_RUN}  MAX_MSGS={MAX_MSGS}')
+
+    conn = psycopg2.connect(EV_DB_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    tbl, cols = get_table_and_columns(cur)
+    if not tbl:
+        log('ERROR: no Message table found')
+        sys.exit(1)
+    log(f'Message table: {tbl!r}  ({len(cols)} columns)')
+    for c, t in cols:
+        log(f'  - {c} :: {t}')
+
     if MODE == 'schema':
-        for tbl in tables:
-            cur.execute("""
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_name = %s AND table_schema='public'
-                ORDER BY ordinal_position
-            """, (tbl,))
-            cols = cur.fetchall()
-            log(f'=== TABLE {tbl!r} ({len(cols)} cols) ===')
-            for c in cols:
-                log(f'  - {c["column_name"]} :: {c["data_type"]}')
-            # Sample row count (guarded)
-            try:
-                cur.execute(f'SELECT COUNT(*) AS n FROM "{tbl}"')
-                n = cur.fetchone()['n']
-                log(f'  rows: {n}')
-            except Exception as e:
-                log(f'  rows: ERROR {e}')
         log('=== schema dump done ===')
         return
 
-    # Step 3: Se mode=count, só conta mensagens da janela
-    message_table = next((t for t in tables if t in ('Message', 'messages', 'message')), None)
-    if not message_table:
-        log('ERROR: no Message table found')
-        sys.exit(1)
-    log(f'Using message table: {message_table!r}')
+    col_names = [c for c, _ in cols]
+    has_instance_id = 'instanceId' in col_names
+    ts_col = 'messageTimestamp' if 'messageTimestamp' in col_names else 'timestamp'
+
+    where_clauses = [f'"{ts_col}" BETWEEN %s AND %s']
+    params = [START_EPOCH, END_EPOCH]
+    if has_instance_id:
+        where_clauses.append('"instanceId" = %s')
+        params.append(INSTANCE_ID)
+
+    where = ' AND '.join(where_clauses)
+    count_sql = f'SELECT COUNT(*) AS n FROM "{tbl}" WHERE {where}'
+    cur.execute(count_sql, params)
+    total_available = cur.fetchone()['n']
+    log(f'COUNT_IN_WINDOW: {total_available}')
 
     if MODE == 'count':
-        try:
-            cur.execute(f'''
-                SELECT COUNT(*) AS n
-                FROM "{message_table}"
-                WHERE "instanceId" = %s
-                  AND "messageTimestamp" BETWEEN %s AND %s
-            ''', (INSTANCE_ID, START_EPOCH, END_EPOCH))
-            n = cur.fetchone()['n']
-            log(f'COUNT_IN_WINDOW: {n}')
-        except Exception as e:
-            log(f'count by instanceId failed: {e}. Trying without filter...')
-            cur.execute(f'''
-                SELECT COUNT(*) AS n
-                FROM "{message_table}"
-                WHERE "messageTimestamp" BETWEEN %s AND %s
-            ''', (START_EPOCH, END_EPOCH))
-            n = cur.fetchone()['n']
-            log(f'COUNT_IN_WINDOW (no instance filter): {n}')
         return
 
-    # Step 4: Dump real de mensagens em batches JSON
-    log(f'Dumping messages in batches of {BATCH_SIZE}...')
-    batch_num = 0
-    total = 0
-    cur.execute(f'''
-        SELECT *
-        FROM "{message_table}"
-        WHERE "messageTimestamp" BETWEEN %s AND %s
-        ORDER BY "messageTimestamp"
-    ''', (START_EPOCH, END_EPOCH))
+    # MODE == 'replay'
+    log(f'Starting replay of up to {MAX_MSGS} messages...')
+    select_sql = f'SELECT * FROM "{tbl}" WHERE {where} ORDER BY "{ts_col}" LIMIT %s'
+    cur.execute(select_sql, params + [MAX_MSGS])
 
-    batch = []
+    sent_ok = 0
+    sent_fail = 0
+    processed = 0
+    t0 = time.time()
+
     for row in cur:
-        batch.append(dict(row))
-        if len(batch) >= BATCH_SIZE:
-            batch_num += 1
-            total += len(batch)
-            # Print one-line JSON prefixed for parsing
-            print(f'BATCH_START batch={batch_num} size={len(batch)}', flush=True)
-            print(json.dumps(batch, default=str, ensure_ascii=False), flush=True)
-            print(f'BATCH_END batch={batch_num}', flush=True)
-            batch = []
+        processed += 1
+        event_data = build_upsert_event(dict(row))
 
-    if batch:
-        batch_num += 1
-        total += len(batch)
-        print(f'BATCH_START batch={batch_num} size={len(batch)}', flush=True)
-        print(json.dumps(batch, default=str, ensure_ascii=False), flush=True)
-        print(f'BATCH_END batch={batch_num}', flush=True)
+        if not event_data['key'].get('id'):
+            sent_fail += 1
+            continue
 
-    log(f'FINAL_TOTAL={total}  batches={batch_num}')
-    log('=== dump done ===')
+        if DRY_RUN:
+            if processed <= 3:
+                log(f'DRY sample: {json.dumps(event_data, default=str)[:300]}')
+            sent_ok += 1
+            continue
+
+        code = post_webhook('messages.upsert', event_data)
+        if 200 <= code < 300:
+            sent_ok += 1
+        else:
+            sent_fail += 1
+            if sent_fail <= 5:
+                log(f'  first failures: msg {event_data["key"]["id"]} -> HTTP {code}')
+
+        if processed % 500 == 0:
+            elapsed = time.time() - t0
+            rate = processed / elapsed if elapsed > 0 else 0
+            log(f'PROGRESS: {processed}/{total_available} sent_ok={sent_ok} fail={sent_fail} rate={rate:.1f} msg/s')
+
+    elapsed = time.time() - t0
+    log(f'=== REPLAY DONE === processed={processed} sent_ok={sent_ok} sent_fail={sent_fail} elapsed={elapsed:.1f}s')
 
 
 if __name__ == '__main__':
