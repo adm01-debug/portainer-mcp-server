@@ -1,0 +1,156 @@
+name: Build & Publish Docker Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'Dockerfile'
+      - '.github/workflows/build-and-publish.yml'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even without changes'
+        required: false
+        default: 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================================================================
+  # Job 1 — Gerar package-lock.json se ainda não existe
+  # ==================================================================
+  ensure-lockfile:
+    name: Ensure package-lock.json
+    runs-on: ubuntu-latest
+    outputs:
+      lockfile_updated: ${{ steps.check.outputs.updated }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check if package-lock.json exists
+        id: check
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "Lock file already exists — nothing to do."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Lock file missing — will generate and commit."
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate package-lock.json
+        if: steps.check.outputs.updated == 'true'
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Commit lockfile
+        if: steps.check.outputs.updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          git commit -m "chore: add package-lock.json [skip ci]"
+          git push
+
+  # ==================================================================
+  # Job 2 — Build multi-arch Docker image and push to ghcr.io
+  # ==================================================================
+  build-and-push:
+    name: Build & Push to ghcr.io
+    runs-on: ubuntu-latest
+    needs: ensure-lockfile
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (post-lockfile-commit)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=portainer-mcp-server
+            org.opencontainers.image.description=MCP Server for Portainer Docker Management
+            org.opencontainers.image.vendor=Promo Brindes
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print published tags
+        run: |
+          echo "✅ Published:"
+          echo "${{ steps.meta.outputs.tags }}"
+
+  # ==================================================================
+  # Job 3 — Trigger Portainer redeploy via webhook (optional)
+  # ==================================================================
+  trigger-portainer-redeploy:
+    name: Trigger Portainer Redeploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Call Portainer webhook
+        run: |
+          if [ -n "${{ secrets.PORTAINER_WEBHOOK_URL }}" ]; then
+            echo "Calling Portainer webhook..."
+            curl -X POST -s -o /dev/null -w "HTTP: %{http_code}\n" \
+              "${{ secrets.PORTAINER_WEBHOOK_URL }}" || true
+          else
+            echo "⚠️  PORTAINER_WEBHOOK_URL secret not set — skipping auto-redeploy."
+            echo "To enable: create a webhook on the portainer-mcp-v2 stack"
+            echo "and add the full URL as a repository secret."
+          fi
